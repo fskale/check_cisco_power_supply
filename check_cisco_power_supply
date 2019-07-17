@@ -1,0 +1,590 @@
+#! /usr/bin/env perl
+package Nagios::Plugin::Cisco::PowerSupply;
+use Mojo::Base -base;
+use Mojo::Util 'dumper';
+use Mojo::ByteStream 'b';
+use Mojo::Collection 'c';
+use Socket qw(:addrinfo IPPROTO_UDP SOCK_DGRAM);
+
+#
+# check_cisco_power_supply - Check Cisco Power Supply (async
+# / non blocking using Mojolicious, EV and Net::SNMP non-blocking)
+# plugin: -epn
+#
+# Copyright (C) 2019 Franz Skale <franz.skale@citycom-austria.com>
+#
+# WCIT
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+
+our $VERSION = "1.0";
+
+BEGIN {
+  #Windows is untested (feel free to do so and report back)
+  die(sprintf("Windows OS not supported !\n")) if $^O =~ /Win/;
+
+#uncomment to enable io_submit async I/O syscalls for EV  on linux > 4.19.x kernels
+#$ENV{LIBEV_FLAGS} = 64;
+
+  #uncomment to enable IOLOOP debugging.
+  #$ENV{MOJO_IOLOOP_DEBUG} = 1;
+
+  my $modules = {
+    q{Monitoring::Plugin} => {minver => q{0.40}},
+    q{Net::DNS::Native}   => {minver => q{0.20}},
+    Mojolicious           => {minver => q{8.18}}
+  };
+
+  my $ev = q{use EV 4.27};
+
+  #EV tested on recent osx(openbsd), linux and freebsd.
+  if ($^O =~ qr/(?:linux|darwin|freebsd|openbsd)/i) {
+    eval $ev;
+    die(sprintf(
+      "Please install module EV version %s or higher !\nError:%s\n",
+      q{4.27}, $@
+    ))
+      if $@;
+  }
+
+  eval { use Net::SNMP 6.0.1 qw(:snmp) };
+  die(sprintf("Please install Net:SNMP version %s!\nError:%s\n", q{6.0.1}, $@))
+    if $@;
+
+  #Mojolicious and other modules should work with most IX OS !
+  foreach my $module (keys %{$modules}) {
+    my $minver = $modules->{$module}->{minver};
+    eval qq{use $module $minver};
+    die(sprintf(
+      "Please install module %s version %s or higher !\nError:%s\n",
+      $module, $minver, $@
+    ))
+      if $@;
+  }
+}
+
+has o_ent       => sub {q{1.3.6.1.2.1.47.1.1.1.1.7}};
+has o_ent_table => sub {q{1.3.6.1.4.1.9.9.117.1.1.2.1.2}};
+has o_env       => sub {q{1.3.6.1.4.1.9.9.13.1.5.1.3}};
+
+has ps_env => sub { {
+  1 => [q{normal(1)},         OK],
+  2 => [q{warning(2)},        WARNING],
+  3 => [q{critical(3)},       CRITICAL],
+  4 => [q{shutdown(4)},       CRITICAL],
+  5 => [q{notPresent(5)},     OK],
+  6 => [q{notFunctioning(6)}, CRITICAL]
+} };
+
+has ps_entity => sub { {
+  1  => [q{offEnvOther(1)},           CRITICAL],
+  2  => [q{on(2)},                    OK],
+  3  => [q{offAdmin(3)},              WARNING],
+  4  => [q{offDenied(4)},             CRITICAL],
+  5  => [q{offEnvPower(5)},           CRITICAL],
+  6  => [q{offEnvTemp(6)},            CRITICAL],
+  7  => [q{offEnvFan(7)},             CRITICAL],
+  8  => [q{failed},                   CRITICAL],
+  9  => [q{onButFanFail(9)},          WARNING],
+  10 => [q{offCooling(10)},           CRITICAL],
+  11 => [q{offConnectorRating(11)},   CRITICAL],
+  12 => [q{onButInlinePowerFail(12)}, WARNING]
+} };
+
+has errors      => sub {q{}};
+has [qw(hostname community session timeout retries verbose)] => sub { };
+has family => sub {q{udp/ipv4}};
+
+has np => sub {
+  Monitoring::Plugin->new(
+    usage =>
+      "Usage: %s [ -V|--version ] [-H|--hostname <host>] [-C|--community <community>] [-t|--timeout <timeout>] [-r|--retries <integer>]",
+    version => $VERSION,
+    timeout => shift->timeout // 5
+  );
+};
+
+sub _init_args {
+  my $self = shift;
+
+  $self->np->add_arg(
+    spec     => 'timeout=i',
+    help     => "--timeout\n   Timeout value in seconds",
+    required => 0,
+  );
+
+  $self->np->add_arg(
+    spec     => 'hostname|H=s',
+    help     => "--hostname\n   Hostname or IP address",
+    required => 1,
+  );
+
+  $self->np->add_arg(
+    spec     => 'community|C=s',
+    help     => "--community\n   SNMP Community",
+    required => 1,
+  );
+
+  $self->np->add_arg(
+    spec     => 'retries|r=i',
+    help     => "--retries\n   Max SNMP retries",
+    required => 0,
+  );
+
+  $self->np->getopts;
+
+  $self->hostname($self->np->opts->hostname);
+  $self->community($self->np->opts->community);
+  $self->timeout($self->np->opts->timeout);
+  $self->retries($self->np->opts->retries // 10);
+  $self->verbose($self->np->opts->verbose // 0);
+
+  #set alarm handler timeout
+  alarm $self->timeout;
+
+  #Timeout on async's not working. Define an ALARM signal handler though.
+  #Overwrite Monitoring::Plugins alarm handler for better error output !
+  $SIG{ALRM} = sub {
+    Mojo::IOLoop->stop;
+    $self->np->plugin_exit(UNKNOWN,
+      sprintf(
+        "SNMP Timeout (%ds) connecting to host %s",
+        $self->timeout, $self->hostname
+      )
+    );
+  };
+  $self;
+}
+
+sub _debug {
+  my ($self, $msg, $cb) = @_;
+
+  return if !$msg or ref $msg or ref $cb ne 'CODE';
+  my $delay  = Mojo::IOLoop::Delay->new;
+  my $stream = Mojo::IOLoop::Stream->new(\*STDERR)->timeout($self->timeout);
+  $stream->start;
+
+  $stream->on(
+    error => sub {
+      my ($stream, $err) = @_;
+      printf(STDERR "_debug: IO/STREAM ERROR: %s\n", $err);
+      $stream->close;
+      $stream->stop;
+    }
+  );
+
+  $delay->steps(
+    sub {
+      my $delay = shift;
+      Mojo::IOLoop->timer(0.1 => $delay->begin);
+      $stream->write(sprintf("_debug: %s\n", $msg));
+    },
+    sub {
+      my $delay = shift;
+      $stream->close;
+      $cb->();
+    }
+  )->wait;
+}
+
+sub _init_snmp {
+  my $self = shift;
+
+  my ($session, $error) = Net::SNMP->session(
+    -hostname    => $self->hostname,
+    -community   => $self->community,
+    -nonblocking => 1,
+    -debug       => $self->verbose ? 0x02 : 0x00,
+    -timeout     => $self->timeout,
+    -domain      => $self->family,
+    -translate   => [-octetstring => 0],
+    -version     => 'snmpv2c',
+  );
+
+  if (!defined $session) {
+    $self->np->plugin_exit(CRITICAL,
+      sprintf(
+        "_get_snmp_data: %s - SNMP Session error: %s",
+        $self->hostname, $error ? $error : q{Unknown error}
+      )
+    );
+  }
+  $self->session($session);
+  $self;
+}
+
+sub _get_request {
+  my ($self, $oids, $d) = @_;
+
+  return if !ref $oids or ref $oids ne 'HASH';
+  my @oids = map { $oids->{$_} } keys %{$oids};
+
+  my $end   = $d->begin;
+  my $delay = Mojo::IOLoop::Delay->new;
+
+  $delay->steps(sub {
+    my $delay = shift;
+    Mojo::IOLoop->timer(0 => $delay->begin);
+    my $result = $self->session->get_request(
+      -varbindlist => [@oids],
+      -callback    => [
+        sub {
+          my ($session, $location) = @_;
+
+          return if !$session;
+          my $list = $session->var_bind_list();
+
+          if (!defined $list) {
+            $self->_debug(
+              sprintf("_get_request: SNMP ERROR: %s\n", $session->error()),
+              $d->begin)
+              if $self->verbose;
+            $self->errors(sprintf(
+              "_get_request: %s - %s",
+              $self->hostname, $session->error()
+            ))
+              if !$self->errors;
+            $end->();
+            $d->pass;
+            return;
+          }
+
+          my ($retvals, $output) = (c(), c());
+          foreach my $oid (keys %{$list}) {
+            foreach my $id (keys %{$oids}) {
+              if ($oids->{$id} eq $oid) {
+                $oids->{$id} = $self->ps_entity->{$list->{$oid}}->[0];
+                push(
+                  @{$output},
+                  sprintf("%s => %s",
+                    $id, $self->ps_entity->{$list->{$oid}}->[0])
+                );
+                push(@{$retvals}, $self->ps_entity->{$list->{$oid}}->[1]);
+              }
+            }
+          }
+          my $retval = $retvals->reduce(sub { ($a > $b) ? $a : $b });
+          $d->pass($output->join(' ')->trim->to_string, $retval);
+          $end->();
+          return;
+        },
+        $self->hostname
+      ]
+    );
+    snmp_dispatcher();
+  })->wait;
+}
+
+sub _get_bulk_request {
+  my ($self, $table, $base_oid, $d) = @_;
+
+  Mojo::IOLoop->timer(0 => $d->begin);
+  my $result = $self->session->get_bulk_request(
+    -varbindlist => [$base_oid],
+    -callback    => [
+      sub {
+        my ($session, $table) = @_;
+
+        return if !$session;
+        my $list = $session->var_bind_list();
+
+        if (!defined $list) {
+          $self->_debug(
+            sprintf("_get_bulk_request: SNMP ERROR: %s\n", $session->error()),
+            $d->begin)
+            if $self->verbose;
+          $self->errors(sprintf(
+            "_get_bulk_request: %s - %s",
+            $self->hostname, $session->error()
+          ))
+            if !$self->errors;
+          return;
+        }
+
+        my @names = $session->var_bind_names();
+        my $next  = undef;
+
+        while (@names) {
+          $next = shift @names;
+          if (!oid_base_match($base_oid, $next)) {
+            return;    # Table is done.
+          }
+          my $value = $list->{$next};
+          if ($value =~ qr/(?:Power Supply Module|power-module)/i) {
+            $table->{$next} = $value;
+          }
+          elsif ($value =~ qr/^(?:[0-9]+)$/) {
+            $table->{$next} = $value;
+          }
+        }
+
+        my $res = $session->get_bulk_request(
+          -varbindlist    => [$next],
+          -maxrepetitions => $self->retries,
+        );
+
+        if (!defined $res) {
+          $self->_debug(
+            sprintf("_get_bulk_request: SNMP RESULT ERROR: %s",
+              $session->error()),
+            $d->begin
+          ) if $self->verbose;
+          $self->errors(sprintf(
+            "_get_bulk_request: %s - %s",
+            $self->hostname, $session->error()
+          ))
+            if !$self->errors;
+          return;
+        }
+
+        return;
+      },
+      $table
+    ],
+    -maxrepetitions => $self->retries
+  );
+  snmp_dispatcher();
+}
+
+sub _get_snmp_data {
+  my ($self, $base_oid, $d) = @_;
+
+  my $table = {};
+  my $delay = Mojo::IOLoop::Delay->new;
+  my $end   = $d->begin;
+
+  $delay->steps(
+    sub {
+      my $delay  = shift;
+      my $result = $self->_get_bulk_request($table, $base_oid, $delay);
+    },
+    sub {
+      my $delay = shift;
+
+      $self->session->close();
+      my $debug_msg = c();
+      if ($table and %{$table}) {
+        for my $oid (oid_lex_sort(keys %{$table})) {
+          (my $index) = $oid =~ qr/(?:$base_oid\.)(.*)$/;
+          $index = sprintf("%s.%s", $self->o_ent_table, $index);
+          push(
+            @{$debug_msg},
+            sprintf("_get_snmp_data: %s => %s\n", $index, $table->{$oid})
+          );
+        }
+        $delay->steps(
+          sub {
+            my $delay = shift;
+            $self->verbose
+              ? $self->_debug(sprintf("%s", $debug_msg->join('')),
+              $delay->begin)
+              : $delay->pass;
+          },
+          sub {
+            $d->pass($table);
+            $end->();
+          }
+        )->wait;
+      }
+      else {
+        $self->errors(sprintf(
+          "_get_snmp_data: %s - No results for OID: %s",
+          $self->hostname, $base_oid
+        ))
+          if !$self->errors;
+        $self->_debug(sprintf("%s", $self->errors), $delay->begin)
+          if $self->verbose;
+        $d->pass;
+        $end->();
+      }
+    }
+  )->wait;
+}
+
+sub _start {
+  my $self = shift;
+  my $d    = Mojo::IOLoop::Delay->new;
+  my $dns  = Net::DNS::Native->new(pool => 5, extra_thread => 1);
+
+  $d->steps(
+    sub {
+      my $delay  = shift;
+      my $result = {};
+      my $end    = $delay->begin;
+      my $fh     = $dns->getaddrinfo($self->hostname, 161,
+        {protocol => IPPROTO_UDP, socktype => SOCK_DGRAM});
+      Mojo::IOLoop->singleton->reactor->io(
+        $fh => sub {
+          my $reactor = shift;
+          $reactor->remove($fh);
+          my ($err, @res) = $dns->get_result($fh);
+          if ($err and !@res) {
+            $self->np->plugin_exit(CRITICAL,
+              sprintf("_start: %s - Error: %s", $self->hostname, $err));
+          }
+          else {
+            foreach my $entry (@res) {
+              $self->_debug(
+                sprintf("_start: Resolved Hostname %s:", $self->hostname),
+                $delay->begin)
+                if $self->verbose;
+              my ($err, $ip, $servicename)
+                = getnameinfo($entry->{addr}, NI_NUMERICHOST);
+              if ($ip) {
+                ($result->{host}, $result->{family})
+                  = ($ip, $ip =~ qr/(?::)/ ? q{udp/ipv6} : q{udp/ipv4});
+                $self->_debug(
+                  sprintf(
+                    "_start: IP: %s Family: %s",
+                    $ip, $ip =~ qr/(?::)/ ? q{udp/ipv6} : q{udp/ipv4}
+                  ),
+                  $delay->begin
+                ) if $self->verbose;
+              }
+              elsif ($err) {
+                $self->_debug(
+                  sprintf(
+                    "_start:  %s - Name resolution error: %s",
+                    $self->hostname, $err
+                  ),
+                  $delay->begin
+                ) if $self->verbose;
+                $self->errors(sprintf(
+                  "_start: %s - Name resolution error: %s",
+                  $self->hostname, $err
+                ))
+                  if !$self->errors;
+              }
+            }
+          }
+          $delay->pass($result);
+          $end->();
+        }
+      )->watch($fh, 1, 0);
+    },
+    sub {
+      my ($delay, $result) = @_;
+      if (  ref $result eq 'HASH'
+        and %{$result}
+        and $result->{host}
+        and $result->{family})
+      {
+        $self->hostname($result->{host});
+        $self->family($result->{family});
+        $self->_init_snmp->_get_snmp_data($self->o_ent, $delay);
+      }
+      else {
+        $delay->pass;
+      }
+    },
+    sub {
+      my ($delay, $result) = @_;
+
+      if ($result and ref $result eq 'HASH' and %{$result}) {
+        my $debug_msg = c();
+        foreach my $i (keys %{$result}) {
+          my $r_oid = $self->o_ent;
+          (my $index) = $i =~ qr/(?:$r_oid\.)(.*)$/;
+          my $oid = sprintf("%s.%s", $self->o_ent_table, $index);
+          $result->{$result->{$i}} = $oid;
+          push(@{$debug_msg}, sprintf("%s => %s\n", $result->{$i}, $oid));
+          delete $result->{$i};
+        }
+        $self->_debug(sprintf("%s", $debug_msg->join('')), $delay->begin)
+          if $self->verbose;
+        $delay->steps(
+          sub {
+            my $delay = shift;
+            $self->_init_snmp->_get_request($result, $delay);
+          },
+          sub {
+            my ($delay, $output, $retval) = @_;
+            if (defined $retval and $output) {
+              $self->np->plugin_exit($retval,
+                sprintf("Host: %s %s", $self->hostname, $output));
+            }
+            else {
+              $self->np->plugin_exit(UNKNOWN,
+                sprintf("Host: %s %s",
+                  $self->hostname,
+                  q{No output. Check -v flag to debug the problem})
+              );
+            }
+          }
+        )->wait;
+      }
+      else {
+        $delay->steps(
+          sub {
+            my $delay = shift;
+            $self->_init_snmp->_get_snmp_data($self->o_env, $delay);
+          },
+          sub {
+            my ($delay, $result) = @_;
+            if ($result and ref $result eq 'HASH' and %{$result}) {
+              $self->_debug(sprintf("_start: %s\n", dumper $result),
+                $delay->begin)
+                if $self->verbose;
+              my ($output, $retvals) = (b(), c());
+              foreach my $ps (keys %{$result}) {
+                my $r_oid = $self->o_env;
+                my ($psu) = $ps =~ qr/^(?:$r_oid.)(\d+)$/;
+                $$output .= sprintf("PSU %d: %s ",
+                  $psu, $self->ps_env->{$result->{$ps}}->[0]);
+                push(@{$retvals}, $self->ps_env->{$result->{$ps}}->[1]);
+              }
+              $delay->steps(
+                sub {
+                  my $delay = shift;
+                  Mojo::IOLoop->timer(0 => $delay->begin);
+                  $self->_debug(
+                    sprintf("Host: %s %s",
+                      $self->hostname, $output->trim->to_string),
+                    $delay->begin
+                  ) if $self->verbose;
+                },
+                sub {
+                  $self->np->plugin_exit(
+                    $retvals->reduce(sub { ($a > $b) ? $a : $b }),
+                    sprintf("Host: %s %s",
+                      $self->hostname, $output->trim->to_string)
+                  );
+                }
+              )->wait;
+            }
+            else {
+              $self->np->plugin_exit(CRITICAL,
+                sprintf(
+                  "%s",
+                  $self->errors ? $self->errors : sprintf(
+                    "No results for OID: %s host: %s",
+                    $self->o_env, $self->hostname
+                  )
+                )
+              );
+            }
+          }
+        )->wait;
+      }
+    }
+  )->wait;
+}
+
+package main;
+use Mojo::Base -strict;
+
+Nagios::Plugin::Cisco::PowerSupply->new->_init_args->_start;
+
+1;
