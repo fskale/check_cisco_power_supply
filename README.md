@@ -47,9 +47,9 @@ check_cisco_power_supply [ -V|--version ] [-H|--hostname <host>]
   `yum groupinstall 'Development Tools'`
   ## Installation of dependend modules
   ### Using cpan:
-  `cpan Mojolicous EV Net::SNMP Net::DNS::Native Monitoring::Plugin`
+  `cpan Mojolicous EV Net::SNMP Net::DNS::Native Monitoring::Plugin Socket6`
   ### Using cpanm:
-  `cpanm Mojolicous EV Net::SNMP Net::DNS::Native Monitoring::Plugin`
+  `cpanm Mojolicous EV Net::SNMP Net::DNS::Native Monitoring::Plugin Socket6`
   ### Example output
   ```CISCO_POWER_SUPPLY OK - Host: 192.168.1.1 power-module 0/PS0/M1/SP => on(2) power-module 0/PS0/M0/SP => on(2)```
   #### Timeout error
